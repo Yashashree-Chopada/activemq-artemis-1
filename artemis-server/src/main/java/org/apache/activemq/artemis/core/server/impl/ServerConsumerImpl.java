@@ -92,7 +92,7 @@ public class ServerConsumerImpl implements ServerConsumer, ReadyListener {
 
    private final int minLargeMessageSize;
 
-   private final ServerSession session;
+   private ServerSession session;
 
    protected final Object lock = new Object();
 
@@ -136,7 +136,7 @@ public class ServerConsumerImpl implements ServerConsumer, ReadyListener {
 
    private final java.util.Deque<MessageReference> deliveringRefs = new ArrayDeque<>();
 
-   private final SessionCallback callback;
+   private SessionCallback callback;
 
    private boolean preAcknowledge;
 
@@ -160,6 +160,10 @@ public class ServerConsumerImpl implements ServerConsumer, ReadyListener {
 
    private boolean isClosed = false;
 
+   @Override
+   public boolean isClosed() {
+      return isClosed;
+   }
 
    public ServerConsumerImpl(final long id,
                              final ServerSession session,
@@ -613,6 +617,15 @@ public class ServerConsumerImpl implements ServerConsumer, ReadyListener {
       if (server.hasBrokerConsumerPlugins()) {
          server.callBrokerConsumerPlugins(plugin -> plugin.afterCloseConsumer(this, failed));
       }
+
+      messageQueue.getExecutor().execute(() -> {
+         protocolContext = null;
+
+         callback = null;
+
+         session = null;
+      });
+
    }
 
    private void addLingerRefs() throws Exception {
@@ -1115,7 +1128,7 @@ public class ServerConsumerImpl implements ServerConsumer, ReadyListener {
     */
    @Override
    public String toString() {
-      return "ServerConsumerImpl [id=" + id + ", filter=" + filter + ", binding=" + binding + "]";
+      return "ServerConsumerImpl [id=" + id + ", filter=" + filter + ", binding=" + binding + ", closed=" + isClosed + "]";
    }
 
    @Override

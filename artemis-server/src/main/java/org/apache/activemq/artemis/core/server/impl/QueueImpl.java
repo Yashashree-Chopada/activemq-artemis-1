@@ -373,10 +373,11 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
       boolean foundRef = false;
 
       synchronized (this) {
-         Iterator<MessageReference> iter = messageReferences.iterator();
-         while (iter.hasNext()) {
-            foundRef = true;
-            out.println("reference = " + iter.next());
+         try (LinkedListIterator<MessageReference> iter = messageReferences.iterator()) {
+            while (iter.hasNext()) {
+               foundRef = true;
+               out.println("reference = " + iter.next());
+            }
          }
       }
 
@@ -1460,7 +1461,7 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
                groups.removeAll();
             }
 
-            ConsumerHolder<Consumer> newConsumerHolder = new ConsumerHolder<>(consumer);
+            ConsumerHolder<Consumer> newConsumerHolder = new ConsumerHolder<>(consumer, this);
             if (consumers.add(newConsumerHolder)) {
                if (delayBeforeDispatch >= 0) {
                   dispatchStartTimeUpdater.compareAndSet(this,-1, delayBeforeDispatch + System.currentTimeMillis());
@@ -1485,13 +1486,14 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
    public void removeConsumer(final Consumer consumer) {
 
       try (ArtemisCloseable metric = measureCritical(CRITICAL_CONSUMER)) {
-         synchronized (this) {
+         synchronized (QueueImpl.this) {
 
             boolean consumerRemoved = false;
             for (ConsumerHolder holder : consumers) {
                if (holder.consumer == consumer) {
                   if (holder.iter != null) {
                      holder.iter.close();
+                     holder.iter = null;
                   }
                   consumers.remove(holder);
                   consumerRemoved = true;
@@ -3031,7 +3033,7 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
          MessageReference ref;
          Consumer handledconsumer = null;
 
-         synchronized (this) {
+         synchronized (QueueImpl.this) {
 
             if (queueDestroyed) {
                if (messageReferences.size() == 0) {
@@ -3064,6 +3066,14 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
 
             Consumer consumer = holder.consumer;
             Consumer groupConsumer = null;
+
+            // we remove the consumerHolder when the Consumer is closed
+            // however the QueueConsumerIterator may hold a reference until the reset is called, which
+            // could happen a little later.
+            if (consumer.isClosed()) {
+               deliverAsync(true);
+               return false;
+            }
 
             if (holder.iter == null) {
                holder.iter = messageReferences.iterator();
@@ -3359,7 +3369,7 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
          if (logger.isTraceEnabled()) {
             logger.trace("QueueImpl::Adding redistributor on queue " + this.toString());
          }
-         redistributor = new ConsumerHolder(new Redistributor(this, storageManager, postOffice));
+         redistributor = new ConsumerHolder(new Redistributor(this, storageManager, postOffice), this);
          redistributor.consumer.start();
          consumers.add(redistributor);
          hasUnMatchedPending = false;
@@ -4182,11 +4192,13 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
 
    protected static class ConsumerHolder<T extends Consumer> implements PriorityAware {
 
-      ConsumerHolder(final T consumer) {
+      ConsumerHolder(final T consumer, final QueueImpl queue) {
          this.consumer = consumer;
+         this.queue = queue;
       }
 
       final T consumer;
+      final QueueImpl queue;
 
       LinkedListIterator<MessageReference> iter;
 
@@ -4217,6 +4229,11 @@ public class QueueImpl extends CriticalComponentImpl implements Queue {
       @Override
       public int getPriority() {
          return consumer.getPriority();
+      }
+
+      @Override
+      public String toString() {
+         return "ConsumerHolder::queue=" + queue + ", consumer=" + consumer;
       }
    }
 

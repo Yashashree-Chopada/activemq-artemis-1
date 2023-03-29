@@ -24,6 +24,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
@@ -139,6 +140,9 @@ import org.jboss.logging.Logger;
  */
 public class OpenWireConnection extends AbstractRemotingConnection implements SecurityAuth, TempQueueObserver {
 
+
+   private final Object lockSend = new Object();
+
    // to be used on the packet size estimate processing for the ThresholdActor
    private static final int MINIMAL_SIZE_ESTIAMTE = 1024;
 
@@ -149,6 +153,8 @@ public class OpenWireConnection extends AbstractRemotingConnection implements Se
    private final OpenWireProtocolManager protocolManager;
 
    private boolean destroyed = false;
+
+   private volatile ScheduledFuture ttlCheck;
 
    //separated in/out wireFormats allow deliveries (eg async and consumers) to not slow down bufferReceived
    private final OpenWireFormat inWireFormat;
@@ -554,12 +560,16 @@ public class OpenWireConnection extends AbstractRemotingConnection implements Se
          final int bufferSize = bytes.length;
          final int maxChunkSize = protocolManager.getOpenwireMaxPacketChunkSize();
 
-         if (maxChunkSize > 0 && bufferSize > maxChunkSize) {
-            chunkSend(bytes, bufferSize, maxChunkSize);
-         } else {
-            final ActiveMQBuffer buffer = transportConnection.createTransportBuffer(bufferSize);
-            buffer.writeBytes(bytes.data, bytes.offset, bufferSize);
-            transportConnection.write(buffer, false, false);
+         // We can't let any other packet to sneak in while chunkSend is happening.
+         // otherwise we may get wrong packts delivered
+         synchronized (lockSend) {
+            if (maxChunkSize > 0 && bufferSize > maxChunkSize) {
+               chunkSend(bytes, bufferSize, maxChunkSize);
+            } else {
+               final ActiveMQBuffer buffer = transportConnection.createTransportBuffer(bufferSize);
+               buffer.writeBytes(bytes.data, bytes.offset, bufferSize);
+               transportConnection.write(buffer, false, false);
+            }
          }
          bufferSent();
       } catch (IOException e) {
@@ -581,7 +591,7 @@ public class OpenWireConnection extends AbstractRemotingConnection implements Se
          }
          final ActiveMQBuffer chunk = transportConnection.createTransportBuffer(chunkSize);
          chunk.writeBytes(bytes.data, bytes.offset, chunkSize);
-         transportConnection.write(chunk, true, false);
+         transportConnection.write(chunk, false, false);
          bytes.setOffset(bytes.getOffset() + chunkSize);
       }
    }
@@ -688,10 +698,18 @@ public class OpenWireConnection extends AbstractRemotingConnection implements Se
 
    private void shutdown(boolean fail) {
 
-      if (fail) {
-         transportConnection.forceClose();
-      } else {
-         transportConnection.close();
+      try {
+         if (fail) {
+            transportConnection.forceClose();
+         } else {
+            transportConnection.close();
+         }
+      } finally {
+         ScheduledFuture ttlCheckToCancel = this.ttlCheck;
+         this.ttlCheck = null;
+         if (ttlCheckToCancel != null) {
+            ttlCheckToCancel.cancel(true);
+         }
       }
    }
 
@@ -1016,7 +1034,7 @@ public class OpenWireConnection extends AbstractRemotingConnection implements Se
       this.maxInactivityDuration = inactivityDuration;
 
       if (this.useKeepAlive) {
-         protocolManager.getScheduledPool().schedule(new Runnable() {
+         ttlCheck = protocolManager.getScheduledPool().schedule(new Runnable() {
             @Override
             public void run() {
                if (inactivityDuration >= 0) {

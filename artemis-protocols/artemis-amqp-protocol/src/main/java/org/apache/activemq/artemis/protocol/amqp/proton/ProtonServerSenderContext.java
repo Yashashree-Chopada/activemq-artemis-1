@@ -124,6 +124,7 @@ public class ProtonServerSenderContext extends ProtonInitializable implements Pr
    // as large message could be interrupted due to flow control and resumed at the same message
    volatile boolean hasLarge = false;
    volatile LargeMessageDeliveryContext pendingLargeMessage = null;
+   volatile Runnable afterLargeMessage;
 
 
    private int credits = 0;
@@ -172,6 +173,10 @@ public class ProtonServerSenderContext extends ProtonInitializable implements Pr
 
    @Override
    public void onFlow(int currentCredits, boolean drain) {
+
+      if (log.isDebugEnabled()) {
+         log.debugf("flow %s, draing=%s", (Object)currentCredits, drain);
+      }
       connection.requireInHandler();
 
       setupCredit();
@@ -181,23 +186,36 @@ public class ProtonServerSenderContext extends ProtonInitializable implements Pr
          // If the draining is already running, then don't do anything
          if (draining.compareAndSet(false, true)) {
             final ProtonServerSenderContext plugSender = (ProtonServerSenderContext) serverConsumer.getProtocolContext();
-            serverConsumer.forceDelivery(1, new Runnable() {
-               @Override
-               public void run() {
-                  try {
-                     connection.runNow(() -> {
-                        plugSender.reportDrained();
-                        setupCredit();
-                     });
-                  } finally {
-                     draining.set(false);
-                  }
-               }
-            });
+            flushDrain(serverConsumer, plugSender);
          }
       } else {
          serverConsumer.receiveCredits(-1);
       }
+   }
+
+   private void flushDrain(ServerConsumerImpl serverConsumer, ProtonServerSenderContext plugSender) {
+      serverConsumer.forceDelivery(1, new Runnable() {
+         @Override
+         public void run() {
+            try {
+               connection.runNow(() -> {
+                  if (pendingLargeMessage != null) {
+                     // retry the flush after the large message is done
+                     afterLargeMessage = () -> flushDrain(serverConsumer, plugSender);
+                  } else {
+                     drained(plugSender);
+                  }
+               });
+            } finally {
+               draining.set(false);
+            }
+         }
+      });
+   }
+
+   private void drained(ProtonServerSenderContext sender) {
+      sender.reportDrained();
+      setupCredit();
    }
 
    public boolean hasCredits() {
@@ -345,7 +363,9 @@ public class ProtonServerSenderContext extends ProtonInitializable implements Pr
       OperationContext oldContext = sessionSPI.recoverContext();
 
       try {
-         Message message = ((MessageReference) delivery.getContext()).getMessage();
+         MessageReference reference = (MessageReference) delivery.getContext();
+         Message message = reference != null ? reference.getMessage() : null;
+
          DeliveryState remoteState = delivery.getRemoteState();
 
          if (remoteState != null && remoteState.getType() == DeliveryStateType.Accepted) {
@@ -772,6 +792,11 @@ public class ProtonServerSenderContext extends ProtonInitializable implements Pr
 
    private void finishLargeMessage() {
       lmUsageDown();
+      Runnable localRunnable = afterLargeMessage;
+      afterLargeMessage = null;
+      if (localRunnable != null) {
+         localRunnable.run();
+      }
       pendingLargeMessage = null;
       hasLarge = false;
       brokerConsumer.promptDelivery();
